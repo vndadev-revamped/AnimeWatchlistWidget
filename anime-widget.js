@@ -195,8 +195,6 @@ async function main() {
             resolve();
           } else {
             console.error(`[ERROR] ❌ Discord API respondió con ${res.statusCode}: ${responseData}`);
-            console.error('[HINT] Verifica que DISCORD_USER_ID sea el ID del SERVIDOR (Guild ID), no tu ID de usuario.');
-            console.error('[HINT] Verifica que el Bot esté en el servidor con permisos de "Manage Server".');
             reject(new Error(`Discord API Error: ${res.statusCode}`));
           }
         });
