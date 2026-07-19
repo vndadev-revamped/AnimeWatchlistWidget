@@ -1,0 +1,24 @@
+name: Update Anime Widget
+
+on:
+  schedule:
+    - cron: "0 0 */1 * *"   # every day at 00:00 UTC
+  workflow_dispatch:        # manual trigger
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      
+      - name: Run Anime Widget Script
+        run: node anime-widget.js
+        env:
+          ANILIST_USERNAME: ${{ secrets.ANILIST_USERNAME }}
+          DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
+          DISCORD_APPLICATION_ID: ${{ secrets.DISCORD_APPLICATION_ID }}
+          DISCORD_USER_ID: ${{ secrets.DISCORD_USER_ID }}
