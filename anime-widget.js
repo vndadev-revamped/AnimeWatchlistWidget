@@ -6,7 +6,7 @@ const https = require('https');
 const ANILIST_USERNAME = process.env.ANILIST_USERNAME;
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const DISCORD_APPLICATION_ID = process.env.DISCORD_APPLICATION_ID;
-const DISCORD_USER_ID = process.env.DISCORD_USER_ID; // DEBE SER EL SERVER ID (GUILD ID)
+const DISCORD_USER_ID = process.env.DISCORD_USER_ID; // Debe ser el SERVER ID
 
 if (!ANILIST_USERNAME || !DISCORD_TOKEN || !DISCORD_APPLICATION_ID || !DISCORD_USER_ID) {
   console.error('[ERROR] Faltan variables de entorno necesarias.');
@@ -29,9 +29,6 @@ query ($userName: String) {
           coverImage {
             large
           }
-          genres
-          averageScore
-          seasonYear
         }
         score
       }
@@ -40,9 +37,6 @@ query ($userName: String) {
       statistics {
         anime {
           count
-          episodesWatched
-          minutesWatched
-          meanScore
         }
       }
     }
@@ -90,72 +84,18 @@ function fetchAniListData() {
 }
 
 // ==========================================
-// LÓGICA DE DEDUPLICACIÓN INTELIGENTE
+// LÓGICA SIMPLE: ORDENAR Y TOMAR TOP 3
 // ==========================================
-function getTop3Unique(animeList) {
-  // 1. Filtrar solo completados con score > 0 y datos válidos
+function getTop3Simple(animeList) {
+  // 1. Filtrar solo completados con score > 0
   const validAnime = animeList.filter(entry => entry.score > 0 && entry.media);
 
-  // 2. Objeto para agrupar por "Nombre Base"
-  const grouped = {};
+  // 2. Ordenar directamente por puntuación (Mayor a Menor)
+  // SIN deduplicación, SIN agrupación, SIN limpieza de títulos.
+  validAnime.sort((a, b) => b.score - a.score);
 
-  validAnime.forEach(entry => {
-    const media = entry.media;
-    // Priorizar título en inglés, si no, romaji
-    let rawTitle = media.title.english || media.title.romaji || "Desconocido";
-    
-    // --- ALGORITMO DE LIMPIEZA DE TÍTULOS ---
-    let cleanTitle = rawTitle;
-
-    // A. Eliminar sufijos de temporadas explícitas (Season 2, Part 2, Cour 2)
-    cleanTitle = cleanTitle.replace(/\s+(?:2nd|3rd|4th|5th|\d+(?:st|nd|rd|th))\s+(?:Season|Part|Cour)/gi, '');
-    cleanTitle = cleanTitle.replace(/\s+Season\s+\d+/gi, '');
-    cleanTitle = cleanTitle.replace(/\s+Part\s+\d+/gi, '');
-    
-    // B. Eliminar sufijos de películas y especiales
-    cleanTitle = cleanTitle.replace(/\s+(?:Movie|Special|OVA|Recap)$/i, '');
-
-    // C. Eliminar símbolos decorativos al final (*, ∽, ∬, ~, †)
-    cleanTitle = cleanTitle.replace(/\s*[\*∽~∼∬†]+\s*$/g, '');
-
-    // D. Eliminar años entre paréntesis o corchetes al final
-    cleanTitle = cleanTitle.replace(/\s*[\(\[]\d{4}[\)\]]\s*$/g, '');
-
-    // E. NUEVO: Eliminar números solos al final que sugieran temporada (ej: "Title 2", "Title 12")
-    // Solo si va precedido de espacio y es un número al final absoluto
-    cleanTitle = cleanTitle.replace(/\s+\d+$/g, '');
-
-    // F. Trim final
-    cleanTitle = cleanTitle.trim();
-
-    // Si la limpieza dejó el título vacío, usamos el original
-    if (!cleanTitle) cleanTitle = rawTitle;
-
-    // --- AGRUPACIÓN ---
-    if (!grouped[cleanTitle]) {
-      grouped[cleanTitle] = {
-        displayTitle: rawTitle,
-        score: entry.score,
-        image: media.coverImage.large,
-        count: 1
-      };
-    } else {
-      // Nos quedamos con la entrada que tenga MAYOR puntuación
-      if (entry.score > grouped[cleanTitle].score) {
-        grouped[cleanTitle].score = entry.score;
-        grouped[cleanTitle].displayTitle = rawTitle;
-        grouped[cleanTitle].image = media.coverImage.large;
-      }
-      grouped[cleanTitle].count++;
-    }
-  });
-
-  // 3. Convertir a array, ordenar descendente por score y tomar los top 3
-  const uniqueList = Object.values(grouped)
-    .sort((a, b) => b.score - a.score)
-    .slice(0, 3);
-
-  return uniqueList;
+  // 3. Tomar los primeros 3
+  return validAnime.slice(0, 3);
 }
 
 // ==========================================
@@ -174,16 +114,17 @@ async function main() {
 
     console.log(`[INFO] Total animes encontrados: ${listEntries.length}`);
 
-    // 2. Procesar Top 3 Único con Deduplicación
-    console.log('[INFO] Calculando Top 3 único...');
-    const top3 = getTop3Unique(listEntries);
+    // 2. Procesar Top 3 (Sin filtros raros)
+    console.log('[INFO] Obteniendo Top 3 por puntuación...');
+    const top3 = getTop3Simple(listEntries);
 
     if (top3.length === 0) {
-      console.warn('[WARN] No se encontraron animes con puntuación para mostrar.');
+      console.warn('[WARN] No se encontraron animes con puntuación.');
     } else {
-      console.log('[INFO] Resultado tras deduplicación:');
-      top3.forEach((anime, i) => {
-        console.log(`   #${i+1}: "${anime.displayTitle}" (Score: ${anime.score}) [Agrupado: ${anime.count} entradas]`);
+      console.log('[INFO] Top 3 seleccionado:');
+      top3.forEach((entry, i) => {
+        const title = entry.media.title.english || entry.media.title.romaji;
+        console.log(`   #${i+1}: "${title}" (Score: ${entry.score})`);
       });
     }
 
@@ -200,17 +141,20 @@ async function main() {
     // B. Campos: Top 3 Nombres e Imágenes
     for (let i = 0; i < 3; i++) {
       if (top3[i]) {
+        const entry = top3[i];
+        const title = entry.media.title.english || entry.media.title.romaji || "Desconocido";
+        
         // Nombre del anime (Texto)
         dynamicFields.push({
           type: 1, 
           name: `anime_nr${i+1}`,
-          value: top3[i].displayTitle
+          value: title
         });
         // Imagen del anime (Image URL)
         dynamicFields.push({
           type: 3, 
           name: `anime_${i+1}`,
-          value: { url: top3[i].image }
+          value: { url: entry.media.coverImage.large }
         });
       } else {
         // Rellenar con valores por defecto si no hay 3 animes
@@ -230,8 +174,6 @@ async function main() {
     // 4. Enviar a Discord API
     console.log('[INFO] Enviando actualización a Discord...');
     const discordData = JSON.stringify(payload);
-    
-    // Endpoint correcto para actualizar widgets de aplicaciones
     const discordOptions = {
       hostname: 'discord.com',
       path: `/api/v10/applications/${DISCORD_APPLICATION_ID}/guilds/${DISCORD_USER_ID}/widget`,
@@ -253,6 +195,8 @@ async function main() {
             resolve();
           } else {
             console.error(`[ERROR] ❌ Discord API respondió con ${res.statusCode}: ${responseData}`);
+            console.error('[HINT] Verifica que DISCORD_USER_ID sea el ID del SERVIDOR (Guild ID), no tu ID de usuario.');
+            console.error('[HINT] Verifica que el Bot esté en el servidor con permisos de "Manage Server".');
             reject(new Error(`Discord API Error: ${res.statusCode}`));
           }
         });
