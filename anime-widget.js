@@ -217,10 +217,13 @@ async function main() {
     username: ANILIST_USERNAME,
     data: {
       dynamic: [
-        { type: 2, name: "anime_watched", value: totalCount },
+        { type: 1, name: "anime_watched", value: String(totalCount) },
         { type: 1, name: "anime_nr1", value: animeNr1 },
         { type: 1, name: "anime_nr2", value: animeNr2 },
         { type: 1, name: "anime_nr3", value: animeNr3 },
+        { type: 3, name: "anime_1", value: { url: top3[0]?.media?.coverImage?.large || "" } },
+        { type: 3, name: "anime_2", value: { url: top3[1]?.media?.coverImage?.large || "" } },
+        { type: 3, name: "anime_3", value: { url: top3[2]?.media?.coverImage?.large || "" } },
       ],
     },
   };
