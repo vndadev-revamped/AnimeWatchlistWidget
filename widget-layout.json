@@ -58,7 +58,7 @@
             },
             "name": {
               "value_type": "data",
-              "presentation_type": "text",
+              "presentation_type": "number",
               "value": "anime_watched"
             }
           }
