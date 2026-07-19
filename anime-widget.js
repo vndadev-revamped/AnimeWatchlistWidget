@@ -1,67 +1,27 @@
-// AniList → Discord Widget Updater
-// Runs in GitHub Actions — one-shot script, no local persistence
-//
-// Prerequisites (one-time manual setup):
-//   1. Get ANILIST_USERNAME (your AniList username)
-//   2. Add it + DISCORD secrets to GitHub Secrets
-//
-// This script:
-//   1. Queries AniList GraphQL API for your anime stats
-//   2. Deduplicates seasonal entries (groups by franchise)
-//   3. Gets total watched count + top 3 highest scored anime
-//   4. Builds the Discord widget payload
-//   5. PATCHes your Discord application profile widget
+const https = require('https');
 
-// ── Environment Variables ──────────────────────────────────────────
+// ==========================================
+// CONFIGURACIÓN (Desde Variables de Entorno)
+// ==========================================
+const ANILIST_USERNAME = process.env.ANILIST_USERNAME;
+const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
+const DISCORD_APPLICATION_ID = process.env.DISCORD_APPLICATION_ID;
+const DISCORD_USER_ID = process.env.DISCORD_USER_ID; // Debe ser el SERVER ID
 
-const {
-  ANILIST_USERNAME,
-  DISCORD_TOKEN,
-  DISCORD_APPLICATION_ID,
-  DISCORD_USER_ID,
-} = process.env;
-
-// ── Validation ─────────────────────────────────────────────────────
-
-const requiredSecrets = [
-  "ANILIST_USERNAME",
-  "DISCORD_TOKEN",
-  "DISCORD_APPLICATION_ID",
-  "DISCORD_USER_ID",
-];
-
-for (const secret of requiredSecrets) {
-  if (!process.env[secret]) {
-    throw new Error(`Missing secret: ${secret}`);
-  }
+if (!ANILIST_USERNAME || !DISCORD_TOKEN || !DISCORD_APPLICATION_ID || !DISCORD_USER_ID) {
+  console.error('[ERROR] Faltan variables de entorno necesarias.');
+  process.exit(1);
 }
 
-// ── Logging ────────────────────────────────────────────────────────
-
-function log(message) {
-  console.log(`[${new Date().toISOString()}] ${message}`);
-}
-
-// ── AniList GraphQL Query ──────────────────────────────────────────
-
-const ANILIST_QUERY = `
-query($userName: String) {
-  User(name: $userName) {
-    statistics {
-      anime {
-        count
-        episodesWatched
-        minutesWatched
-        meanScore
-      }
-    }
-  }
-  MediaListCollection(userName: $userName, type: ANIME, status: COMPLETED, sort: SCORE_DESC) {
+// ==========================================
+// QUERY GRAPHQL A ANILIST
+// ==========================================
+const query = `
+query ($userName: String) {
+  MediaListCollection(userName: $userName, type: ANIME, status: COMPLETED) {
     lists {
       entries {
-        score
         media {
-          id
           title {
             romaji
             english
@@ -69,7 +29,20 @@ query($userName: String) {
           coverImage {
             large
           }
-          format
+          genres
+          averageScore
+          seasonYear
+        }
+        score
+      }
+    }
+    user {
+      statistics {
+        anime {
+          count
+          episodesWatched
+          minutesWatched
+          meanScore
         }
       }
     }
@@ -77,169 +50,225 @@ query($userName: String) {
 }
 `;
 
-async function fetchAniListData(username) {
-  log("Fetching AniList data...");
+const variables = { userName: ANILIST_USERNAME };
 
-  const res = await fetch("https://graphql.anilist.co", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      query: ANILIST_QUERY,
-      variables: { userName: username },
-    }),
+// ==========================================
+// FUNCIÓN: PETICIÓN HTTPS A ANILIST
+// ==========================================
+function fetchAniListData() {
+  return new Promise((resolve, reject) => {
+    const data = JSON.stringify({ query, variables });
+    const options = {
+      hostname: 'graphql.anilist.co',
+      path: '/',
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': data.length,
+        'Accept': 'application/json'
+      }
+    };
+
+    const req = https.request(options, (res) => {
+      let responseData = '';
+      res.on('data', (chunk) => { responseData += chunk; });
+      res.on('end', () => {
+        try {
+          const json = JSON.parse(responseData);
+          if (json.errors) throw new Error(json.errors[0].message);
+          resolve(json.data);
+        } catch (e) {
+          reject(e);
+        }
+      });
+    });
+
+    req.on('error', (e) => reject(e));
+    req.write(data);
+    req.end();
   });
-
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`AniList API failed (${res.status}): ${text}`);
-  }
-
-  const data = await res.json();
-
-  if (data.errors) {
-    throw new Error(`AniList GraphQL error: ${JSON.stringify(data.errors)}`);
-  }
-
-  return data.data;
 }
 
-// ── Deduplication Logic ────────────────────────────────────────────
+// ==========================================
+// LÓGICA DE DEDUPLICACIÓN INTELIGENTE
+// ==========================================
+function getTop3Unique(animeList) {
+  // 1. Filtrar solo completados con score > 0 y datos válidos
+  const validAnime = animeList.filter(entry => entry.score > 0 && entry.media);
 
-/**
- * Groups anime entries by franchise to avoid duplicates like:
- * "OSHI NO KO", "OSHI NO KO Season 2", "OSHI NO KO Movie"
- * 
- * Returns the highest scored entry from each franchise
- */
-function deduplicateByFranchise(entries) {
-  const franchiseMap = new Map();
+  // 2. Objeto para agrupar por "Nombre Base"
+  const grouped = {};
 
-  // Regex patterns to detect season/sequel indicators
-  const seasonPatterns = [
-    /\s+Season\s+\d+/i,
-    /\s+\d+(st|nd|rd|th)\s+Season/i,
-    /\s+Part\s+\d+/i,
-    /\s+Cour\s+\d+/i,
-    /\s+Movie$/i,
-    /\s+Film$/i,
-    /\s+Special$/i,
-    /\s+OVA$/i,
-  ];
+  validAnime.forEach(entry => {
+    const media = entry.media;
+    // Priorizar título en inglés, si no, romaji
+    let rawTitle = media.title.english || media.title.romaji || "Desconocido";
+    
+    // --- ALGORITMO DE LIMPIEZA DE TÍTULOS ---
+    let cleanTitle = rawTitle;
 
-  for (const entry of entries) {
-    const title = entry.media.title.romaji || entry.media.title.english || "";
-    const score = entry.score || 0;
+    // A. Eliminar sufijos comunes de temporadas y partes
+    // Ej: "2nd Season", "Part 2", "Cour 2", "Season 3"
+    cleanTitle = cleanTitle.replace(/\s+(?:2nd|3rd|4th|5th|\d+(?:st|nd|rd|th))\s+(?:Season|Part|Cour)/gi, '');
+    cleanTitle = cleanTitle.replace(/\s+Season\s+\d+/gi, '');
+    cleanTitle = cleanTitle.replace(/\s+Part\s+\d+/gi, '');
+    
+    // B. Eliminar sufijos de películas y especiales
+    // Ej: "Movie", "Special", "OVA"
+    cleanTitle = cleanTitle.replace(/\s+(?:Movie|Special|OVA|Recap)$/i, '');
 
-    // Normalize title by removing season indicators
-    let normalizedTitle = title;
-    for (const pattern of seasonPatterns) {
-      normalizedTitle = normalizedTitle.replace(pattern, "");
-    }
-    normalizedTitle = normalizedTitle.trim();
+    // C. Eliminar símbolos decorativos al final (muy común en AniList)
+    // Ej: "*", "∽", "∬", "~", "†"
+    cleanTitle = cleanTitle.replace(/\s*[\*∽~∼∬†]+\s*$/g, '');
 
-    // Keep the highest scored entry for each franchise
-    if (!franchiseMap.has(normalizedTitle)) {
-      franchiseMap.set(normalizedTitle, { ...entry, normalizedTitle });
+    // D. Eliminar años entre paréntesis o corchetes al final
+    // Ej: "(2020)", "[2021]"
+    cleanTitle = cleanTitle.replace(/\s*[\(\[]\d{4}[\)\]]\s*$/g, '');
+
+    // E. Trim final para limpiar espacios sobrantes
+    cleanTitle = cleanTitle.trim();
+
+    // Si la limpieza dejó el título vacío (caso extremo), usamos el original
+    if (!cleanTitle) cleanTitle = rawTitle;
+
+    // --- AGRUPACIÓN ---
+    // Usamos el 'cleanTitle' como clave única
+    if (!grouped[cleanTitle]) {
+      grouped[cleanTitle] = {
+        displayTitle: rawTitle, // Guardamos el título original para mostrar
+        score: entry.score,
+        image: media.coverImage.large,
+        count: 1
+      };
     } else {
-      const existing = franchiseMap.get(normalizedTitle);
-      if (score > existing.score) {
-        franchiseMap.set(normalizedTitle, { ...entry, normalizedTitle });
+      // Si ya existe esta franquicia, comparamos puntuaciones
+      // Nos quedamos con la entrada que tenga MAYOR puntuación
+      if (entry.score > grouped[cleanTitle].score) {
+        grouped[cleanTitle].score = entry.score;
+        grouped[cleanTitle].displayTitle = rawTitle; // Actualizamos al título de la versión mejor puntuada
+        grouped[cleanTitle].image = media.coverImage.large;
+      }
+      grouped[cleanTitle].count++;
+    }
+  });
+
+  // 3. Convertir a array, ordenar descendente por score y tomar los top 3
+  const uniqueList = Object.values(grouped)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 3);
+
+  return uniqueList;
+}
+
+// ==========================================
+// FUNCIÓN PRINCIPAL
+// ==========================================
+async function main() {
+  console.log(`[INFO] Iniciando actualización para usuario: ${ANILIST_USERNAME}`);
+
+  try {
+    // 1. Obtener datos de AniList
+    console.log('[INFO] Conectando con AniList API...');
+    const data = await fetchAniListData();
+    
+    const listEntries = data.MediaListCollection.lists.flatMap(list => list.entries);
+    const stats = data.MediaListCollection.user.statistics.anime;
+
+    console.log(`[INFO] Total animes encontrados en lista: ${listEntries.length}`);
+
+    // 2. Procesar Top 3 Único con Deduplicación
+    console.log('[INFO] Calculando Top 3 único (agrupando franquicias)...');
+    const top3 = getTop3Unique(listEntries);
+
+    if (top3.length === 0) {
+      console.warn('[WARN] No se encontraron animes con puntuación para mostrar.');
+    } else {
+      console.log('[INFO] Resultado tras deduplicación:');
+      top3.forEach((anime, i) => {
+        console.log(`   #${i+1}: "${anime.displayTitle}" (Score: ${anime.score}) [Agrupado: ${anime.count} entradas]`);
+      });
+    }
+
+    // 3. Construir Payload para Discord
+    const dynamicFields = [];
+
+    // A. Campo: Total Anime Watched (Como TEXTO, tipo 1, para coincidir con tu config)
+    dynamicFields.push({
+      type: 1, 
+      name: "anime_watched",
+      value: stats.count.toString() 
+    });
+
+    // B. Campos: Top 3 Nombres e Imágenes
+    for (let i = 0; i < 3; i++) {
+      if (top3[i]) {
+        // Nombre del anime (Texto)
+        dynamicFields.push({
+          type: 1, 
+          name: `anime_nr${i+1}`,
+          value: top3[i].displayTitle
+        });
+        // Imagen del anime (Image URL)
+        dynamicFields.push({
+          type: 3, 
+          name: `anime_${i+1}`,
+          value: { url: top3[i].image }
+        });
+      } else {
+        // Rellenar con valores por defecto si no hay 3 animes
+        dynamicFields.push({ type: 1, name: `anime_nr${i+1}`, value: "N/A" });
+        dynamicFields.push({ type: 3, name: `anime_${i+1}`, value: { url: "https://via.placeholder.com/150?text=Empty" } });
       }
     }
-  }
 
-  return Array.from(franchiseMap.values());
-}
+    const payload = {
+      data: {
+        dynamic: dynamicFields
+      }
+    };
 
-// ── Discord widget update ──────────────────────────────────────────
+    console.log('[INFO] Payload generado correctamente.');
+    // console.log(JSON.stringify(payload, null, 2)); // Descomentar para debug detallado
 
-async function updateDiscordWidget(payload) {
-  log("Updating Discord widget...");
-
-  const res = await fetch(
-    `https://discord.com/api/v10/applications/${DISCORD_APPLICATION_ID}/users/${DISCORD_USER_ID}/identities/0/profile`,
-    {
-      method: "PATCH",
+    // 4. Enviar a Discord API
+    console.log('[INFO] Enviando actualización a Discord...');
+    const discordData = JSON.stringify(payload);
+    const discordOptions = {
+      hostname: 'discord.com',
+      path: `/api/v10/applications/${DISCORD_APPLICATION_ID}/guilds/${DISCORD_USER_ID}/widget`,
+      method: 'PATCH',
       headers: {
-        Authorization: `Bot ${DISCORD_TOKEN}`,
-        "Content-Type": "application/json",
-        "User-Agent":
-          "DiscordBot (https://github.com/discord/discord-api-docs, 1.0.0)",
-      },
-      body: JSON.stringify(payload),
-    }
-  );
+        'Authorization': `Bot ${DISCORD_TOKEN}`,
+        'Content-Type': 'application/json',
+        'Content-Length': discordData.length
+      }
+    };
 
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`Discord API ${res.status}: ${text}`);
-  }
+    await new Promise((resolve, reject) => {
+      const req = https.request(discordOptions, (res) => {
+        let responseData = '';
+        res.on('data', (chunk) => { responseData += chunk; });
+        res.on('end', () => {
+          if (res.statusCode >= 200 && res.statusCode < 300) {
+            console.log('[SUCCESS] ✅ Widget de Discord actualizado correctamente.');
+            resolve();
+          } else {
+            console.error(`[ERROR] ❌ Discord API respondió con ${res.statusCode}: ${responseData}`);
+            reject(new Error(`Discord API Error: ${res.statusCode}`));
+          }
+        });
+      });
+      req.on('error', (e) => reject(e));
+      req.write(discordData);
+      req.end();
+    });
 
-  log("Discord widget updated.");
-}
+    console.log('[INFO] 🎉 Proceso finalizado con éxito.');
 
-// ── MAIN ───────────────────────────────────────────────────────────
-
-async function main() {
-  // 1. Fetch data from AniList
-  const data = await fetchAniListData(ANILIST_USERNAME);
-
-  // 2. Extract stats
-  log("Calculating statistics...");
-
-  const animeStats = data.User.statistics.anime;
-  const totalCount = animeStats.count ?? 0;
-
-  // Get completed anime list and deduplicate
-  const completedEntries = data.MediaListCollection.lists?.[0]?.entries ?? [];
-  const deduplicated = deduplicateByFranchise(completedEntries);
-
-  // Get top 3 highest scored anime
-  const top3 = deduplicated.slice(0, 3);
-
-  const animeNr1 = top3[0]?.media?.title?.romaji || top3[0]?.media?.title?.english || "None";
-  const animeNr2 = top3[1]?.media?.title?.romaji || top3[1]?.media?.title?.english || "None";
-  const animeNr3 = top3[2]?.media?.title?.romaji || top3[2]?.media?.title?.english || "None";
-
-  // 3. Console summary
-  log("─────────────────────────────");
-  log(`Username: ${ANILIST_USERNAME}`);
-  log(`Total Anime Watched: ${totalCount}`);
-  log(`Top #1: ${animeNr1}${top3[0]?.score ? ` (Score: ${top3[0].score})` : ""}`);
-  log(`Top #2: ${animeNr2}${top3[1]?.score ? ` (Score: ${top3[1].score})` : ""}`);
-  log(`Top #3: ${animeNr3}${top3[2]?.score ? ` (Score: ${top3[2].score})` : ""}`);
-  log("─────────────────────────────");
-
-  // 4. Build widget payload
-  log("Building widget payload...");
-
-  const widget = {
-    username: ANILIST_USERNAME,
-    data: {
-      dynamic: [
-        { type: 1, name: "anime_watched", value: String(totalCount) },
-        { type: 1, name: "anime_nr1", value: animeNr1 },
-        { type: 1, name: "anime_nr2", value: animeNr2 },
-        { type: 1, name: "anime_nr3", value: animeNr3 },
-        { type: 3, name: "anime_1", value: { url: top3[0]?.media?.coverImage?.large || "" } },
-        { type: 3, name: "anime_2", value: { url: top3[1]?.media?.coverImage?.large || "" } },
-        { type: 3, name: "anime_3", value: { url: top3[2]?.media?.coverImage?.large || "" } },
-      ],
-    },
-  };
-
-  log("Widget payload:");
-  console.log(JSON.stringify(widget, null, 2));
-
-  // 5. Push to Discord
-  await updateDiscordWidget(widget);
-
-  log("Anime widget update completed successfully.");
-}
-
-main()
-  .then(() => log("Finished successfully."))
-  .catch((err) => {
-    console.error(err);
+  } catch (error) {
+    console.error('[FATAL] 💥 Error crítico:', error.message);
     process.exit(1);
-  });
+  }
+}
+
+main();
