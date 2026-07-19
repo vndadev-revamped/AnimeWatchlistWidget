@@ -47,9 +47,9 @@
         "item_1": {
           "fields": {
             "description": {
-              "value_type": "data",
+              "value_type": "custom_string",
               "presentation_type": "text",
-              "value": "anime_watched"
+              "value": "Watched:"
             },
             "image": {
               "value_type": "application_asset",
@@ -57,9 +57,9 @@
               "value": "Crunchyroll-logo-anime-streaming-platform-anime-tr"
             },
             "name": {
-              "value_type": "custom_string",
+              "value_type": "data",
               "presentation_type": "text",
-              "value": "Watched:"
+              "value": "anime_watched"
             }
           }
         },
