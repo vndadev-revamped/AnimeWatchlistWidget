@@ -1,19 +1,10 @@
 ```
-# Executable files
-*.exe
-*.dll
-*.so
-*.out
-
-# Temporary files
+# Logs and temp files
+*.log
 *.tmp
 *.swp
-*.swo
 
-# Logs
-*.log
-
-# Environment files
+# Environment
 .env
 .env.local
 *.env.*
@@ -24,19 +15,35 @@
 
 # Dependencies
 node_modules/
-venv/
 .venv/
+venv/
 __pycache__/
 .mypy_cache/
 .pytest_cache/
+.julia/
+zig*/
+julia-*/
+
+# Build artifacts
 dist/
 build/
 target/
-.gradle/
+*.o
+*.obj
+*.out
+*.exe
+*.dll
+*.so
+*.a
 
-# System files
+# OS files
 .DS_Store
 Thumbs.db
+
+# Coverage
+coverage/
+htmlcov/
+.coverage
 
 # Compressed files
 *.zip
