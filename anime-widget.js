@@ -6,7 +6,7 @@ const https = require('https');
 const ANILIST_USERNAME = process.env.ANILIST_USERNAME;
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const DISCORD_APPLICATION_ID = process.env.DISCORD_APPLICATION_ID;
-const DISCORD_USER_ID = process.env.DISCORD_USER_ID; // Debe ser el SERVER ID
+const DISCORD_USER_ID = process.env.DISCORD_USER_ID; // DEBE SER EL SERVER ID (GUILD ID)
 
 if (!ANILIST_USERNAME || !DISCORD_TOKEN || !DISCORD_APPLICATION_ID || !DISCORD_USER_ID) {
   console.error('[ERROR] Faltan variables de entorno necesarias.');
@@ -107,7 +107,7 @@ function getTop3Unique(animeList) {
     // --- ALGORITMO DE LIMPIEZA DE TÍTULOS ---
     let cleanTitle = rawTitle;
 
-    // A. Eliminar sufijos comunes de temporadas y partes
+    // A. Eliminar sufijos de temporadas explícitas (Season 2, Part 2, Cour 2)
     cleanTitle = cleanTitle.replace(/\s+(?:2nd|3rd|4th|5th|\d+(?:st|nd|rd|th))\s+(?:Season|Part|Cour)/gi, '');
     cleanTitle = cleanTitle.replace(/\s+Season\s+\d+/gi, '');
     cleanTitle = cleanTitle.replace(/\s+Part\s+\d+/gi, '');
@@ -115,15 +115,20 @@ function getTop3Unique(animeList) {
     // B. Eliminar sufijos de películas y especiales
     cleanTitle = cleanTitle.replace(/\s+(?:Movie|Special|OVA|Recap)$/i, '');
 
-    // C. Eliminar símbolos decorativos al final
+    // C. Eliminar símbolos decorativos al final (*, ∽, ∬, ~, †)
     cleanTitle = cleanTitle.replace(/\s*[\*∽~∼∬†]+\s*$/g, '');
 
     // D. Eliminar años entre paréntesis o corchetes al final
     cleanTitle = cleanTitle.replace(/\s*[\(\[]\d{4}[\)\]]\s*$/g, '');
 
-    // E. Trim final
+    // E. NUEVO: Eliminar números solos al final que sugieran temporada (ej: "Title 2", "Title 12")
+    // Solo si va precedido de espacio y es un número al final absoluto
+    cleanTitle = cleanTitle.replace(/\s+\d+$/g, '');
+
+    // F. Trim final
     cleanTitle = cleanTitle.trim();
 
+    // Si la limpieza dejó el título vacío, usamos el original
     if (!cleanTitle) cleanTitle = rawTitle;
 
     // --- AGRUPACIÓN ---
@@ -135,6 +140,7 @@ function getTop3Unique(animeList) {
         count: 1
       };
     } else {
+      // Nos quedamos con la entrada que tenga MAYOR puntuación
       if (entry.score > grouped[cleanTitle].score) {
         grouped[cleanTitle].score = entry.score;
         grouped[cleanTitle].displayTitle = rawTitle;
@@ -144,7 +150,7 @@ function getTop3Unique(animeList) {
     }
   });
 
-  // 3. Ordenar y tomar top 3
+  // 3. Convertir a array, ordenar descendente por score y tomar los top 3
   const uniqueList = Object.values(grouped)
     .sort((a, b) => b.score - a.score)
     .slice(0, 3);
@@ -159,7 +165,7 @@ async function main() {
   console.log(`[INFO] Iniciando actualización para usuario: ${ANILIST_USERNAME}`);
 
   try {
-    // 1. Obtener datos
+    // 1. Obtener datos de AniList
     console.log('[INFO] Conectando con AniList API...');
     const data = await fetchAniListData();
     
@@ -168,21 +174,23 @@ async function main() {
 
     console.log(`[INFO] Total animes encontrados: ${listEntries.length}`);
 
-    // 2. Procesar Top 3
+    // 2. Procesar Top 3 Único con Deduplicación
     console.log('[INFO] Calculando Top 3 único...');
     const top3 = getTop3Unique(listEntries);
 
-    if (top3.length > 0) {
+    if (top3.length === 0) {
+      console.warn('[WARN] No se encontraron animes con puntuación para mostrar.');
+    } else {
       console.log('[INFO] Resultado tras deduplicación:');
       top3.forEach((anime, i) => {
-        console.log(`   #${i+1}: "${anime.displayTitle}" (Score: ${anime.score})`);
+        console.log(`   #${i+1}: "${anime.displayTitle}" (Score: ${anime.score}) [Agrupado: ${anime.count} entradas]`);
       });
     }
 
-    // 3. Construir Payload
+    // 3. Construir Payload para Discord
     const dynamicFields = [];
 
-    // A. Campo: Total Anime Watched (Texto)
+    // A. Campo: Total Anime Watched (Como TEXTO, tipo 1)
     dynamicFields.push({
       type: 1, 
       name: "anime_watched",
@@ -192,23 +200,25 @@ async function main() {
     // B. Campos: Top 3 Nombres e Imágenes
     for (let i = 0; i < 3; i++) {
       if (top3[i]) {
+        // Nombre del anime (Texto)
         dynamicFields.push({
           type: 1, 
           name: `anime_nr${i+1}`,
           value: top3[i].displayTitle
         });
+        // Imagen del anime (Image URL)
         dynamicFields.push({
           type: 3, 
           name: `anime_${i+1}`,
           value: { url: top3[i].image }
         });
       } else {
+        // Rellenar con valores por defecto si no hay 3 animes
         dynamicFields.push({ type: 1, name: `anime_nr${i+1}`, value: "N/A" });
         dynamicFields.push({ type: 3, name: `anime_${i+1}`, value: { url: "https://via.placeholder.com/150?text=Empty" } });
       }
     }
 
-    // ✅ CORRECCIÓN AQUÍ: Agregada la propiedad "data:"
     const payload = {
       data: {
         dynamic: dynamicFields
@@ -217,9 +227,11 @@ async function main() {
 
     console.log('[INFO] Payload generado correctamente.');
 
-    // 4. Enviar a Discord
+    // 4. Enviar a Discord API
     console.log('[INFO] Enviando actualización a Discord...');
     const discordData = JSON.stringify(payload);
+    
+    // Endpoint correcto para actualizar widgets de aplicaciones
     const discordOptions = {
       hostname: 'discord.com',
       path: `/api/v10/applications/${DISCORD_APPLICATION_ID}/guilds/${DISCORD_USER_ID}/widget`,
