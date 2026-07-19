@@ -1,59 +1,119 @@
-const https = require('https');
-const fs = require('fs');
-const path = require('path');
+// Anime → Discord Widget Updater
+// Runs in GitHub Actions — one-shot script, no local persistence
+//
+// Prerequisites (one-time manual setup):
+//   1. Get ANILIST_USERNAME (your AniList profile name)
+//   2. Add it + DISCORD secrets to GitHub Secrets
+//
+// This script:
+//   1. Fetches your completed anime list from AniList GraphQL API
+//   2. Calculates top 3 anime by score
+//   3. Builds the Discord widget payload
+//   4. PATCHes your Discord application profile widget
 
-// ==========================================
-// CONFIGURACIÓN (Desde Variables de Entorno)
-// ==========================================
-const ANILIST_USERNAME = process.env.ANILIST_USERNAME;
-const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
-const DISCORD_APPLICATION_ID = process.env.DISCORD_APPLICATION_ID;
-const DISCORD_USER_ID = process.env.DISCORD_USER_ID; // Debe ser el SERVER ID
+// ── Environment Variables ──────────────────────────────────────────
 
-if (!ANILIST_USERNAME || !DISCORD_TOKEN || !DISCORD_APPLICATION_ID || !DISCORD_USER_ID) {
-  console.error('[ERROR] Faltan variables de entorno necesarias.');
-  process.exit(1);
-}
+const {
+  ANILIST_USERNAME,
+  DISCORD_TOKEN,
+  DISCORD_APPLICATION_ID,
+  DISCORD_USER_ID,
+} = process.env;
 
-// ==========================================
-// CARGAR LAYOUT DESDE JSON (Como Steam/Spotify)
-// ==========================================
-let layoutConfig;
-try {
-  const layoutPath = path.join(__dirname, 'widget-layout.json');
-  const layoutData = fs.readFileSync(layoutPath, 'utf8');
-  layoutConfig = JSON.parse(layoutData);
-  console.log('[INFO] widget-layout.json cargado correctamente.');
-} catch (error) {
-  console.error('[ERROR] No se pudo leer o parsear widget-layout.json:', error.message);
-  process.exit(1);
-}
+// ── Validation ─────────────────────────────────────────────────────
 
-// Extraer los nombres de las variables dinámicas del JSON
-// Buscamos en data.dynamic los nombres para usarlos como claves
-const dynamicFieldsConfig = layoutConfig.data?.dynamic || [];
-const fieldNames = {};
+const requiredSecrets = [
+  "ANILIST_USERNAME",
+  "DISCORD_TOKEN",
+  "DISCORD_APPLICATION_ID",
+  "DISCORD_USER_ID",
+];
 
-dynamicFieldsConfig.forEach(field => {
-  if (field.name) {
-    // Guardamos el tipo esperado si quisieramos validarlo, pero principalmente el nombre
-    fieldNames[field.name] = field.type; 
+for (const secret of requiredSecrets) {
+  if (!process.env[secret]) {
+    throw new Error(`Missing secret: ${secret}`);
   }
-});
-
-// Validar que tenemos los campos necesarios
-const requiredFields = ['anime_watched', 'anime_nr1', 'anime_nr2', 'anime_nr3', 'anime_1', 'anime_2', 'anime_3'];
-const missingFields = requiredFields.filter(f => !fieldNames[f]);
-
-if (missingFields.length > 0) {
-  console.warn(`[WARN] El layout no define los campos: ${missingFields.join(', ')}. El widget podría no mostrarse bien.`);
-} else {
-  console.log('[INFO] Todos los campos requeridos encontrados en el layout.');
 }
 
-// ==========================================
-// QUERY GRAPHQL A ANILIST
-// ==========================================
+// ── Logging ────────────────────────────────────────────────────────
+
+function log(message) {
+  console.log(`[${new Date().toISOString()}] ${message}`);
+}
+
+// ── Delay Helper ───────────────────────────────────────────────────
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// ── Fetch JSON with Retries ────────────────────────────────────────
+
+async function anilistFetch(query, variables, retries = 3) {
+  const url = "https://graphql.anilist.co";
+  const data = JSON.stringify({ query, variables });
+
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      const res = await fetch(url, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Accept": "application/json",
+        },
+        body: data,
+      });
+
+      if (!res.ok) {
+        const text = await res.text();
+        throw new Error(`AniList API ${res.status}\n${text}`);
+      }
+
+      const json = await res.json();
+      if (json.errors) {
+        throw new Error(`AniList GraphQL Error: ${json.errors[0].message}`);
+      }
+
+      return json.data;
+    } catch (err) {
+      if (attempt === retries) {
+        throw err;
+      }
+      log(`AniList request failed (${attempt}/${retries}), retrying...`);
+      await delay(1500);
+    }
+  }
+}
+
+// ── Discord widget update ──────────────────────────────────────────
+
+async function updateDiscordWidget(payload) {
+  log("Updating Discord widget...");
+
+  const res = await fetch(
+    `https://discord.com/api/v10/applications/${DISCORD_APPLICATION_ID}/users/${DISCORD_USER_ID}/identities/0/profile`,
+    {
+      method: "PATCH",
+      headers: {
+        Authorization: `Bot ${DISCORD_TOKEN}`,
+        "Content-Type": "application/json",
+        "User-Agent":
+          "DiscordBot (https://github.com/discord/discord-api-docs, 1.0.0)",
+      },
+      body: JSON.stringify(payload),
+    }
+  );
+
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Discord API ${res.status}: ${text}`);
+  }
+
+  log("Discord widget updated.");
+}
+
+// ── GraphQL Query ─────────────────────────────────────────────────
+
 const query = `
 query ($userName: String) {
   MediaListCollection(userName: $userName, type: ANIME, status: COMPLETED) {
@@ -85,187 +145,110 @@ query ($userName: String) {
 
 const variables = { userName: ANILIST_USERNAME };
 
-// ==========================================
-// FUNCIÓN: PETICIÓN HTTPS A ANILIST
-// ==========================================
-function fetchAniListData() {
-  return new Promise((resolve, reject) => {
-    const data = JSON.stringify({ query, variables });
-    const options = {
-      hostname: 'graphql.anilist.co',
-      path: '/',
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Content-Length': data.length,
-        'Accept': 'application/json'
-      }
-    };
+// ── Get Top 3 Anime by Score ──────────────────────────────────────
 
-    const req = https.request(options, (res) => {
-      let responseData = '';
-      res.on('data', (chunk) => { responseData += chunk; });
-      res.on('end', () => {
-        try {
-          const json = JSON.parse(responseData);
-          if (json.errors) throw new Error(json.errors[0].message);
-          resolve(json.data);
-        } catch (e) {
-          reject(e);
-        }
-      });
-    });
+function getTop3ByScore(animeList) {
+  const validAnime = animeList.filter(
+    (entry) => entry.score > 0 && entry.media
+  );
 
-    req.on('error', (e) => reject(e));
-    req.write(data);
-    req.end();
-  });
-}
-
-// ==========================================
-// LÓGICA SIMPLE: TOP 3 POR PUNTAJE (Sin deduplicación rara)
-// ==========================================
-function getTop3Simple(animeList) {
-  // 1. Filtrar válidos
-  const validAnime = animeList.filter(entry => entry.score > 0 && entry.media);
-
-  // 2. Ordenar por score descendente
   validAnime.sort((a, b) => b.score - a.score);
 
-  // 3. Tomar los primeros 3
-  return validAnime.slice(0, 3).map(entry => ({
-    title: entry.media.title.english || entry.media.title.romaji || "Desconocido",
+  return validAnime.slice(0, 3).map((entry) => ({
+    title: entry.media.title.english || entry.media.title.romaji || "Unknown",
     score: entry.score,
-    image: entry.media.coverImage.large
+    image: entry.media.coverImage.large,
   }));
 }
 
-// ==========================================
-// FUNCIÓN PRINCIPAL
-// ==========================================
+// ── MAIN ───────────────────────────────────────────────────────────
+
 async function main() {
-  console.log(`[INFO] Iniciando actualización para usuario: ${ANILIST_USERNAME}`);
+  log(`Starting update for AniList user: ${ANILIST_USERNAME}`);
 
-  try {
-    // 1. Obtener datos de AniList
-    console.log('[INFO] Conectando con AniList API...');
-    const data = await fetchAniListData();
-    
-    const listEntries = data.MediaListCollection.lists.flatMap(list => list.entries);
-    const stats = data.MediaListCollection.user.statistics.anime;
+  // 1. Fetch data from AniList
+  log("Fetching AniList data...");
+  const data = await anilistFetch(query, variables);
 
-    console.log(`[INFO] Total animes encontrados: ${listEntries.length}`);
+  const listEntries = data.MediaListCollection.lists.flatMap(
+    (list) => list.entries
+  );
+  const stats = data.MediaListCollection.user.statistics.anime;
 
-    // 2. Calcular Top 3 Simple
-    console.log('[INFO] Calculando Top 3 por puntuación...');
-    const top3 = getTop3Simple(listEntries);
+  log(`Found ${listEntries.length} completed anime.`);
 
-    if (top3.length === 0) {
-      console.warn('[WARN] No se encontraron animes con puntuación.');
-    } else {
-      console.log('[INFO] Top 3 seleccionado:');
-      top3.forEach((anime, i) => {
-        console.log(`   #${i+1}: "${anime.title}" (Score: ${anime.score})`);
-      });
-    }
+  // 2. Calculate top 3 by score
+  log("Calculating top 3 anime by score...");
+  const top3 = getTop3ByScore(listEntries);
 
-    // 3. Construir Payload usando LOS NOMBRES DEL JSON
-    const dynamicFields = [];
-
-    // A. Campo: Total Anime Watched
-    // Usamos el nombre exacto del JSON: 'anime_watched'
-    if (fieldNames['anime_watched'] !== undefined) {
-      dynamicFields.push({
-        type: fieldNames['anime_watched'], // Respeta el tipo del JSON (1 para texto)
-        name: "anime_watched",
-        value: stats.count.toString() 
-      });
-    }
-
-    // B. Campos: Top 3 Nombres e Imágenes
-    for (let i = 0; i < 3; i++) {
-      const index = i + 1;
-      const nameKey = `anime_nr${index}`;
-      const imageKey = `anime_${index}`;
-
-      if (top3[i]) {
-        // Nombre
-        if (fieldNames[nameKey] !== undefined) {
-          dynamicFields.push({
-            type: fieldNames[nameKey],
-            name: nameKey,
-            value: top3[i].title
-          });
-        }
-        // Imagen
-        if (fieldNames[imageKey] !== undefined) {
-          dynamicFields.push({
-            type: fieldNames[imageKey],
-            name: imageKey,
-            value: { url: top3[i].image }
-          });
-        }
-      } else {
-        // Rellenar si no hay datos
-        if (fieldNames[nameKey] !== undefined) {
-          dynamicFields.push({ type: fieldNames[nameKey], name: nameKey, value: "N/A" });
-        }
-        if (fieldNames[imageKey] !== undefined) {
-          dynamicFields.push({ type: fieldNames[imageKey], name: imageKey, value: { url: "https://via.placeholder.com/150?text=Empty" } });
-        }
-      }
-    }
-
-    // Estructura final del payload (igual que Steam/Spotify)
-    const payload = {
-      data: {
-        dynamic: dynamicFields
-      }
-    };
-
-    console.log('[INFO] Payload generado con nombres del layout.');
-    // console.log(JSON.stringify(payload, null, 2)); 
-
-    // 4. Enviar a Discord API
-    console.log('[INFO] Enviando actualización a Discord...');
-    const discordData = JSON.stringify(payload);
-    const discordOptions = {
-      hostname: 'discord.com',
-      path: `/api/v10/applications/${DISCORD_APPLICATION_ID}/guilds/${DISCORD_USER_ID}/widget`,
-      method: 'PATCH',
-      headers: {
-        'Authorization': `Bot ${DISCORD_TOKEN}`,
-        'Content-Type': 'application/json',
-        'Content-Length': discordData.length
-      }
-    };
-
-    await new Promise((resolve, reject) => {
-      const req = https.request(discordOptions, (res) => {
-        let responseData = '';
-        res.on('data', (chunk) => { responseData += chunk; });
-        res.on('end', () => {
-          if (res.statusCode >= 200 && res.statusCode < 300) {
-            console.log('[SUCCESS] ✅ Widget de Discord actualizado correctamente.');
-            resolve();
-          } else {
-            console.error(`[ERROR] ❌ Discord API respondió con ${res.statusCode}: ${responseData}`);
-            console.error('[HINT] Verifica que DISCORD_USER_ID sea el ID del SERVIDOR, no de la App ni del Usuario.');
-            reject(new Error(`Discord API Error: ${res.statusCode}`));
-          }
-        });
-      });
-      req.on('error', (e) => reject(e));
-      req.write(discordData);
-      req.end();
+  if (top3.length === 0) {
+    log("WARNING: No anime with scores found.");
+  } else {
+    log("Top 3 anime:");
+    top3.forEach((anime, i) => {
+      log(`   #${i + 1}: "${anime.title}" (Score: ${anime.score})`);
     });
-
-    console.log('[INFO] 🎉 Proceso finalizado con éxito.');
-
-  } catch (error) {
-    console.error('[FATAL] 💥 Error crítico:', error.message);
-    process.exit(1);
   }
+
+  // 3. Build widget payload
+  log("Building widget payload...");
+
+  const dynamicFields = [
+    {
+      type: 1,
+      name: "anime_watched",
+      value: stats.count.toString(),
+    },
+    {
+      type: 1,
+      name: "anime_nr1",
+      value: top3[0]?.title || "N/A",
+    },
+    {
+      type: 1,
+      name: "anime_nr2",
+      value: top3[1]?.title || "N/A",
+    },
+    {
+      type: 1,
+      name: "anime_nr3",
+      value: top3[2]?.title || "N/A",
+    },
+    {
+      type: 3,
+      name: "anime_1",
+      value: { url: top3[0]?.image || "" },
+    },
+    {
+      type: 3,
+      name: "anime_2",
+      value: { url: top3[1]?.image || "" },
+    },
+    {
+      type: 3,
+      name: "anime_3",
+      value: { url: top3[2]?.image || "" },
+    },
+  ];
+
+  const widget = {
+    data: {
+      dynamic: dynamicFields,
+    },
+  };
+
+  log("Widget payload:");
+  console.log(JSON.stringify(widget, null, 2));
+
+  // 4. Update Discord widget
+  await updateDiscordWidget(widget);
+
+  log("Anime widget update completed successfully.");
 }
 
-main();
+main()
+  .then(() => log("Finished successfully."))
+  .catch((err) => {
+    console.error(err);
+    process.exit(1);
+  });
